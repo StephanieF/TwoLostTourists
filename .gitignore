@@ -43,3 +43,21 @@ next-env.d.ts
 .dev.vars*
 !.dev.vars.example
 !.env.example
+
+# never commit original photos (EXIF/GPS) — reference Cloudflare Images IDs instead
+content/**/*.jpg
+content/**/*.jpeg
+content/**/*.png
+content/**/*.heic
+content/**/*.heif
+content/**/*.raw
+content/**/*.cr2
+content/**/*.cr3
+content/**/*.nef
+content/**/*.arw
+content/**/*.dng
+content/**/*.tif
+content/**/*.tiff
+content/**/*.webp
+content/**/*.gif
+content/**/*.bmp

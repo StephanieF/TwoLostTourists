@@ -10,12 +10,10 @@ hands-on repair/restoration of the coach. Country Coach wound down around 2009, 
 parts-sourcing and keeping an orphaned luxury coach running is a recurring,
 deliberately useful theme — write for the person trying to keep one of these alive.
 
-The codebase itself is still an early-stage scaffold: the only application code
-present is the default `create-next-app` page ([src/app/page.tsx](src/app/page.tsx))
-and root layout ([src/app/layout.tsx](src/app/layout.tsx)) — no custom routes,
-content pipeline, or Cloudflare Images integration has been built yet. Treat the
-sections below on voice, privacy, and Cloudflare Images as the target architecture
-to build toward, not a description of what's already implemented.
+The blog content pipeline, routes, and D1-backed search described under
+[Architecture](#architecture) are built. Cloudflare Images itself (the actual
+account/variants) is still the user's manual setup step — the code is ready to
+consume it via `NEXT_PUBLIC_CF_IMAGES_DELIVERY_URL` once configured.
 
 ## Voice & style: "Famous Hands"
 - Modeled on older printed DIY/shop manuals where only the demonstrator's hands
@@ -49,13 +47,15 @@ could identify the author, their exact location, or the vehicle's identity.
 
 ## Commands
 
-- `npm run dev` — start the Next.js dev server (Turbopack) at http://localhost:3000
-- `npm run build` — production build via `next build`
-- `npm run lint` — run `next lint` (ESLint, flat config extending `next/core-web-vitals` and `next/typescript`)
+- `npm run dev` — start the Next.js dev server (Turbopack) at http://localhost:3000 (runs `generate-content` first)
+- `npm run build` — production build via `next build` (runs `generate-content` first)
+- `npm run lint` — run `next lint`. **Currently broken** on this Next.js 16.2.10 / eslint-config-next / ESLint 9.39 combination, pre-existing and unrelated to app code (`next lint` fails with "Invalid project directory"; running `eslint` directly hits a circular-JSON error in `@eslint/eslintrc`'s legacy compat shim). Confirmed broken on the bare scaffold too — not something to "fix" as part of an unrelated task without calling it out first.
 - `npm run preview` — build with `opennextjs-cloudflare` and preview locally under the actual Cloudflare Workers runtime (use this, not `next start`, to validate Cloudflare-specific behavior like bindings and image optimization)
 - `npm run deploy` — build and deploy to Cloudflare via `opennextjs-cloudflare`
 - `npm run upload` — build and upload a new version to Cloudflare without deploying it
 - `npm run cf-typegen` — regenerate `cloudflare-env.d.ts` types from `wrangler.jsonc` bindings (run after adding/changing any binding)
+- `npm run generate-content` — regenerate `src/generated/posts.json` (frontmatter index) from `content/posts/*.mdx`; runs automatically before dev/build/preview/deploy/upload
+- `npm run sync-content` — regenerate `d1/seed.sql` from `content/posts/*.mdx`, for the D1 search index (see Architecture below). Apply with `wrangler d1 execute twolosttourists-blog --local/--remote --file=d1/seed.sql`
 
 There is no test setup in this repo yet.
 
@@ -64,10 +64,16 @@ There is no test setup in this repo yet.
 - **Framework**: Next.js App Router (`src/app/`), TypeScript, Tailwind CSS v4 (via `@tailwindcss/postcss`), path alias `@/*` → `./src/*`.
 - **Deployment target**: Cloudflare Workers, not Vercel/Node, via `@opennextjs/cloudflare`, which converts the Next.js build output into a Worker (`.open-next/worker.js`, referenced as `main` in [wrangler.jsonc](wrangler.jsonc)). Static assets are served via the `ASSETS` binding pointing at `.open-next/assets`.
 - **Local Cloudflare bindings in `next dev`**: [next.config.ts](next.config.ts) calls `initOpenNextCloudflareForDev()` so that `getCloudflareContext()` works while running the plain `next dev` server, without needing `wrangler dev`.
-- **Bindings/config**: [wrangler.jsonc](wrangler.jsonc) is the source of truth for Cloudflare bindings (KV, D1, R2, vars, secrets, services, etc.). No bindings are configured yet — the relevant sections are present but commented out as templates. After adding a binding, update `wrangler.jsonc` and re-run `npm run cf-typegen` to refresh `cloudflare-env.d.ts` (a large generated file — do not hand-edit it).
+- **Bindings/config**: [wrangler.jsonc](wrangler.jsonc) is the source of truth for Cloudflare bindings. `d1_databases` (binding `DB`, database `twolosttourists-blog`) is configured for the blog search index — see below. KV/R2/vars/services templates remain commented out, unused. After adding a binding, update `wrangler.jsonc` and re-run `npm run cf-typegen` to refresh `cloudflare-env.d.ts` (a large generated file — do not hand-edit it).
 - **Env vars for local dev**: `.dev.vars` (gitignored, based on `.dev.vars.example`) is loaded by `wrangler`/OpenNext for `NEXTJS_ENV` and other local secrets — do not commit real values here.
 - **Observability**: `wrangler.jsonc` has `observability.logs` and `observability.traces` enabled with `persist: true`, but the top-level `observability.enabled` flag is currently `false`.
-- **Images (target architecture)**: Cloudflare Images is intended as the CDN and origin store for photos. `next/image` optimization should be backed by Cloudflare Images on this adapter — large photos never live in the repo; the repo holds content (markdown), code, and small UI assets only.
+- **Images**: Cloudflare Images is the CDN and origin store for photos. `next.config.ts` sets a **custom** `next/image` loader (`src/lib/cloudflare-image-loader.ts`) rather than OpenNext's own Images-binding optimizer, since photos are already optimized/cached by Cloudflare Images itself — re-optimizing through `/_next/image` would double-process them. The loader maps requested widths to a small set of **named** Cloudflare Images variants (`sm`/`md`/`lg`) rather than passing arbitrary `w=` params through, per the flexible-variant restriction above. Requires `NEXT_PUBLIC_CF_IMAGES_DELIVERY_URL` in `.env.local` (see `.env.example`) — a Next.js build-time var, not a `.dev.vars`/Wrangler binding, since the loader runs outside the Worker binding runtime.
+- **Blog content pipeline**: Posts are MDX files with frontmatter under `content/posts/*.mdx` (`title`, `date`, `excerpt`, `tags`, optional `draft`/`coverImageId`). No separate `category` field — every post's `tags` includes exactly one of `restoration` or `road-trip` plus topical tags; `/blog/tag/[tag]` serves both the two nav sections and ordinary tags.
+  - **Rendering**: MDX bodies are compiled to plain JS at build time via `@next/mdx` (configured in `next.config.ts` with `remark-frontmatter` + `remark-gfm`, passed as **string** plugin names — required for Turbopack) and loaded via a dynamic `import(`@content/posts/${slug}.mdx`)` in `src/app/blog/[slug]/page.tsx`. Global MDX component overrides (incl. a `Figure` component requiring `alt` text — reinforces the "action and part, never the person" caption rule) live in the required `src/mdx-components.tsx` convention file.
+  - **Do not use `next-mdx-remote` or any runtime MDX compiler** (e.g. `evaluate`/`compile` called per-request). Cloudflare Workers' V8 isolates disallow dynamic code generation (`new Function`/`eval`) with no compat flag to re-enable it — runtime MDX compilation throws `EvalError: Code generation from strings disallowed for this context`. MDX must be compiled ahead of time by the bundler.
+  - **Do not read `content/` with `fs.readdirSync`/`readFileSync` at request time** — the Workers `nodejs_compat` polyfill doesn't implement `readdirSync` (throws `[unenv] fs.readdirSync is not implemented yet!`), and even routes that look purely static can still have their page function executed inside the Worker at request time (not just at build), so this isn't limited to routes marked "dynamic". Post frontmatter is instead pre-baked at build time into `src/generated/posts.json` (via `npm run generate-content`, a plain JSON import — no runtime fs) and read through `src/lib/posts.ts`.
+- **D1 (search only)**: A `posts` table (`d1/schema.sql`) backs `/blog/search` — the one genuinely dynamic route (arbitrary keyword `LIKE` query against `env.DB`). Every other blog route (index, tag, post) is fully static-generated via `generateStaticParams` reading `src/generated/posts.json` at build time — no DB read needed there, so don't add one. Binding name is `DB`. Content syncs into D1 via `npm run sync-content` → `d1/seed.sql` (committed, generated — do not hand-edit), applied manually with `wrangler d1 execute`; there's no Wrangler D1 migrations setup for this one small denormalized index table.
+- **Photo guardrail**: `.gitignore` blocks raw photo extensions under `content/**` so an original camera file can't be accidentally committed alongside a post.
 
 ## Engineering rules
 - Keep `@opennextjs/cloudflare` and Next.js current. The `/_next/image` route has had
